@@ -1,0 +1,10 @@
+# Generated C function variants — produced by generate.py, not source code
+output/
+
+# Benchmark results — produced by benchmark.sh, regeneratable
+results.csv
+
+# Compiled binaries
+*.o
+*.out
+a.out
