@@ -17,13 +17,19 @@ from dataclasses import dataclass, field
 
 
 # Top-level constants — change these to scale the dataset.
-N_FUNCTIONS           = 1000
+N_FUNCTIONS           = 5000
 SEED                  = 42        # fixed seed for reproducibility
 OUTPUT_DIR            = "output"
 ITERATION_COUNT_RANGE = (2, 64)   # wider range: short loops favour unrolling, long loops hurt code cache
 MAX_UNROLLED_STMTS    = 5000      # hard cap: if unrolling would exceed this many statements, keep the loop
 LOOP_COUNT_RANGE      = (1, 3)    # how many top-level loops per function
 NESTING_DEPTH_RANGE   = (1, 5)    # deeper nesting (up to 4 levels) produces large unrolled code, balancing the dataset
+
+# Fraction of functions deliberately generated with max nesting depth and high
+# iteration counts to produce more "don't unroll" examples.
+# Without this, random generation skews toward shallow loops where unrolling
+# almost always wins, causing severe class imbalance (83/17 on 1000 samples).
+HARD_EXAMPLE_RATIO    = 0.35      # 35% of functions are forced hard cases
 
 # Which variants to write for every function.
 # "original" is always the identity (no transformation).
@@ -66,6 +72,7 @@ class Config:
         default_factory=lambda: list(BODY_PATTERNS)
     )
     max_unrolled_stmts:      int   = MAX_UNROLLED_STMTS
+    hard_example_ratio:      float = HARD_EXAMPLE_RATIO
 
 
 # ── Section 2: IR (Intermediate Representation) dataclasses ─────────────────
@@ -182,10 +189,17 @@ class FunctionGenerator:
         self._rng    = rng
 
     def generate(self, index: int) -> FunctionSpec:
-        """Generate one function spec with a unique name based on index."""
-        name       = f"func_{index:04d}"
-        loop_count = self._rng.randint(*self._config.loop_count_range)
-        loops      = [self._make_loop(depth=0) for _ in range(loop_count)]
+        """Generate one function spec with a unique name based on index.
+
+        HARD_EXAMPLE_RATIO % of functions are forced to use maximum nesting
+        depth and the upper half of the iteration count range. These functions
+        are very likely to exceed MAX_UNROLLED_STMTS and produce label=0,
+        balancing the dataset against the natural majority of easy-to-unroll loops.
+        """
+        name     = f"func_{index:04d}"
+        is_hard  = self._rng.random() < self._config.hard_example_ratio
+        loops    = [self._make_loop(depth=0, force_deep=is_hard) for _ in
+                    range(self._rng.randint(*self._config.loop_count_range))]
 
         return FunctionSpec(
             name        = name,
@@ -198,27 +212,35 @@ class FunctionGenerator:
             result_var = "sum",
         )
 
-    def _make_loop(self, depth: int) -> LoopSpec:
+    def _make_loop(self, depth: int, force_deep: bool = False) -> LoopSpec:
         """Recursively build a loop, nesting down to a random max depth.
 
         depth=0 is the outermost loop. Each call may create an inner loop
         until the configured max nesting depth is reached.
+
+        force_deep=True forces maximum nesting depth and picks iteration counts
+        from the upper half of the range, producing functions that are very
+        likely to exceed MAX_UNROLLED_STMTS and generate label=0 examples.
         """
         max_depth = self._config.nesting_depth_range[1] - 1  # 0-indexed
 
-        # Scale the iteration count down as nesting gets deeper.
-        # Without this, a depth-5 loop with 128 iterations produces 128^5
-        # statements when unrolled, exhausting memory.
+        # Scale iteration count down per depth level to avoid memory blowup.
         # Each depth level halves the max allowed iterations.
-        base_max  = self._config.iteration_count_range[1]
-        scaled_max = max(2, base_max // (2 ** depth))
-        iteration_count = self._rng.randint(self._config.iteration_count_range[0], scaled_max)
+        base_max    = self._config.iteration_count_range[1]
+        scaled_max  = max(2, base_max // (2 ** depth))
 
-        variable  = _LOOP_VARS[depth]
+        if force_deep:
+            # Hard examples: pick from the upper half of the scaled range
+            # to maximise unrolled size and push past MAX_UNROLLED_STMTS.
+            mid = max(2, (self._config.iteration_count_range[0] + scaled_max) // 2)
+            iteration_count = self._rng.randint(mid, scaled_max)
+        else:
+            iteration_count = self._rng.randint(
+                self._config.iteration_count_range[0], scaled_max
+            )
 
-        # Pick a random body pattern for this loop level.
-        # The pattern is chosen once per loop so all iterations share it.
-        pattern = self._rng.choice(self._config.body_patterns)
+        variable = _LOOP_VARS[depth]
+        pattern  = self._rng.choice(self._config.body_patterns)
 
         # At the innermost level, add the actual work statement.
         # At outer levels, the body is empty — work happens in the inner loop.
@@ -226,11 +248,11 @@ class FunctionGenerator:
             body       = [Statement(pattern.replace("{var}", f"{{{variable}}}"))]
             inner_loop = None
         else:
-            # Randomly decide whether to nest deeper or stop here.
-            go_deeper  = self._rng.random() < 0.5
+            # Hard examples always nest deeper; normal examples decide randomly.
+            go_deeper = force_deep or (self._rng.random() < 0.5)
             if go_deeper:
                 body       = []
-                inner_loop = self._make_loop(depth + 1)
+                inner_loop = self._make_loop(depth + 1, force_deep=force_deep)
             else:
                 body       = [Statement(pattern.replace("{var}", f"{{{variable}}}"))]
                 inner_loop = None
