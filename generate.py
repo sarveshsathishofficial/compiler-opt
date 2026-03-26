@@ -398,9 +398,10 @@ class CRenderer:
             count = loop.iteration_count
             lines.append(f"{indent}for (int {var} = 0; {var} < {count}; {var}++) {{")
 
-            # Render body statements at the next indentation level.
+            # Render body statements, substituting {var} with the loop variable name.
             for stmt in loop.body:
-                lines.append(f"{indent}{INDENT}{stmt.template}")
+                rendered = stmt.template.replace(f"{{{var}}}", var)
+                lines.append(f"{indent}{INDENT}{rendered}")
 
             # Render the inner loop recursively if present.
             if loop.inner_loop is not None:
@@ -499,3 +500,46 @@ class TransformationRegistry:
                 )
             result.append((name, self._transforms[name]))
         return result
+
+
+# ── Section 8: main ──────────────────────────────────────────────────────────
+# Wires all components together and runs the generation pipeline.
+# This is the only place that knows about all components simultaneously.
+
+import sys
+
+
+def main() -> None:
+    config   = Config()
+    rng      = _random.Random(config.seed)
+    renderer = CRenderer()
+    writer   = OutputWriter(config, renderer)
+    gen      = FunctionGenerator(config, rng)
+
+    # Register transformations.
+    # "original" is always the identity — no changes, just renders as-is.
+    # Add new transformations here as the project grows.
+    registry = TransformationRegistry()
+    registry.register("original", lambda s: s)
+    registry.register("unrolled", LoopUnroller().transform)
+
+    enabled = registry.get_enabled(config)
+
+    print(f"Generating {config.n_functions} functions -> {config.output_dir}/")
+
+    for i in range(config.n_functions):
+        spec = gen.generate(index=i)
+
+        for name, transform_fn in enabled:
+            transformed = transform_fn(spec)
+            writer.write(transformed, transformation_name=name)
+
+        # Print progress every 100 functions so the user knows it's running.
+        if (i + 1) % 100 == 0:
+            print(f"  {i + 1}/{config.n_functions}")
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
