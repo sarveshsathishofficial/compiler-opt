@@ -134,3 +134,79 @@ class FunctionSpec:
     parameters:  list[ParameterSpec] = field(default_factory=list)
     loops:       list[LoopSpec]      = field(default_factory=list)
     result_var:  str                 = "sum"  # name of the accumulator variable (e.g. sum += arr[i]); overridable per function
+
+
+# ── Section 3: FunctionGenerator ────────────────────────────────────────────
+# Responsible for creating random FunctionSpec instances.
+# All random decisions are made here and nowhere else.
+# Takes a seeded random.Random instance so output is reproducible and
+# safe to parallelize later without global state interference.
+
+import random as _random
+
+
+# Loop variable names assigned by nesting depth (depth 0 = i, 1 = j, 2 = k).
+_LOOP_VARS = ["i", "j", "k"]
+
+
+class FunctionGenerator:
+    """Creates random FunctionSpec instances from a Config.
+
+    Usage:
+        rng = random.Random(config.seed)
+        gen = FunctionGenerator(config, rng)
+        spec = gen.generate(index=0)
+    """
+
+    def __init__(self, config: Config, rng: _random.Random) -> None:
+        self._config = config
+        self._rng    = rng
+
+    def generate(self, index: int) -> FunctionSpec:
+        """Generate one function spec with a unique name based on index."""
+        name       = f"func_{index:04d}"
+        loop_count = self._rng.randint(*self._config.loop_count_range)
+        loops      = [self._make_loop(depth=0) for _ in range(loop_count)]
+
+        return FunctionSpec(
+            name        = name,
+            return_type = "int",
+            parameters  = [
+                ParameterSpec("arr", "int *"),
+                ParameterSpec("n",   "int"),
+            ],
+            loops      = loops,
+            result_var = "sum",
+        )
+
+    def _make_loop(self, depth: int) -> LoopSpec:
+        """Recursively build a loop, nesting down to a random max depth.
+
+        depth=0 is the outermost loop. Each call may create an inner loop
+        until the configured max nesting depth is reached.
+        """
+        max_depth       = self._config.nesting_depth_range[1] - 1  # 0-indexed
+        iteration_count = self._rng.randint(*self._config.iteration_count_range)
+        variable        = _LOOP_VARS[depth]
+
+        # At the innermost level, add the actual work statement.
+        # At outer levels, the body is empty — work happens in the inner loop.
+        if depth >= max_depth:
+            body       = [Statement(f"sum += arr[{{{variable}}}];")]
+            inner_loop = None
+        else:
+            # Randomly decide whether to nest deeper or stop here.
+            go_deeper  = self._rng.random() < 0.5
+            if go_deeper:
+                body       = []
+                inner_loop = self._make_loop(depth + 1)
+            else:
+                body       = [Statement(f"sum += arr[{{{variable}}}];")]
+                inner_loop = None
+
+        return LoopSpec(
+            variable        = variable,
+            iteration_count = iteration_count,
+            body            = body,
+            inner_loop      = inner_loop,
+        )
