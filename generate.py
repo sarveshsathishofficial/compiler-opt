@@ -29,6 +29,20 @@ NESTING_DEPTH_RANGE   = (1, 3)    # 1 = flat, 2 = one level of nesting, 3 = two 
 # Add new transformation names here once they are registered in main().
 ENABLED_TRANSFORMATIONS = ["original", "unrolled"]
 
+# Body patterns used inside loop iterations.
+# {var} is replaced with the loop variable at render/unroll time.
+# These cover the most common loop body shapes:
+#   - dependent reductions (each iteration needs the previous result)
+#   - independent transformations (iterations can run in parallel)
+# Phase 2 will replace these with feature extraction so the model generalises
+# to loop bodies it was not explicitly trained on.
+BODY_PATTERNS = [
+    "sum += arr[{var}];",              # addition reduction (dependent)
+    "sum *= arr[{var}];",              # multiplication reduction (dependent)
+    "arr[{var}] = arr[{var}] * 2;",   # independent in-place transformation
+    "sum += arr[{var}] * arr[{var}];", # multiply-accumulate (dependent)
+]
+
 
 @dataclass
 class Config:
@@ -46,6 +60,9 @@ class Config:
     nesting_depth_range:     tuple = NESTING_DEPTH_RANGE   # max depth of 3 avoids combinatorial explosion while covering real-world nesting patterns
     enabled_transformations: list  = field(
         default_factory=lambda: list(ENABLED_TRANSFORMATIONS)
+    )
+    body_patterns:           list  = field(
+        default_factory=lambda: list(BODY_PATTERNS)
     )
 
 
@@ -189,10 +206,14 @@ class FunctionGenerator:
         iteration_count = self._rng.randint(*self._config.iteration_count_range)
         variable        = _LOOP_VARS[depth]
 
+        # Pick a random body pattern for this loop level.
+        # The pattern is chosen once per loop so all iterations share it.
+        pattern = self._rng.choice(self._config.body_patterns)
+
         # At the innermost level, add the actual work statement.
         # At outer levels, the body is empty — work happens in the inner loop.
         if depth >= max_depth:
-            body       = [Statement(f"sum += arr[{{{variable}}}];")]
+            body       = [Statement(pattern.replace("{var}", f"{{{variable}}}"))]
             inner_loop = None
         else:
             # Randomly decide whether to nest deeper or stop here.
@@ -201,7 +222,7 @@ class FunctionGenerator:
                 body       = []
                 inner_loop = self._make_loop(depth + 1)
             else:
-                body       = [Statement(f"sum += arr[{{{variable}}}];")]
+                body       = [Statement(pattern.replace("{var}", f"{{{variable}}}"))]
                 inner_loop = None
 
         return LoopSpec(
