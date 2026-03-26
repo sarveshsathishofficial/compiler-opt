@@ -410,3 +410,92 @@ class CRenderer:
             lines.append(f"{indent}}}")
 
         return lines
+
+
+# ── Section 6: OutputWriter ──────────────────────────────────────────────────
+# Owns all file system interaction. Renders a spec and writes it to disk.
+# No transformation logic, no random logic — only path construction and I/O.
+#
+# Output structure:
+#   output/
+#     func_0000/
+#       original.c
+#       unrolled.c
+#     func_0001/
+#       ...
+#
+# One directory per function. Each transformation is one .c file inside it.
+# This layout makes it easy to load all variants of a function together during
+# ML training without any path gymnastics.
+
+import os
+
+
+class OutputWriter:
+    """Writes rendered C source files to disk under the configured output directory."""
+
+    def __init__(self, config: Config, renderer: CRenderer) -> None:
+        self._config   = config
+        self._renderer = renderer
+
+    def write(self, spec: FunctionSpec, transformation_name: str) -> str:
+        """Render spec and write it to output/<func_name>/<transformation_name>.c.
+
+        Returns the path of the written file.
+        """
+        dir_path  = os.path.join(self._config.output_dir, spec.name)
+        file_path = os.path.join(dir_path, f"{transformation_name}.c")
+
+        os.makedirs(dir_path, exist_ok=True)
+
+        source = self._renderer.render(spec)
+        with open(file_path, "w") as f:
+            f.write(source)
+
+        return file_path
+
+
+# ── Section 7: TransformationRegistry ───────────────────────────────────────
+# Maps transformation names to callables.
+# The registry is the single extension point for adding new transformations.
+# The main loop iterates over enabled transformations by name, looks each up
+# here, and applies it — without knowing anything about the transformation itself.
+
+from typing import Callable
+
+
+class TransformationRegistry:
+    """Maps transformation names to transform(FunctionSpec) -> FunctionSpec callables.
+
+    Usage:
+        registry = TransformationRegistry()
+        registry.register("original", lambda s: s)
+        registry.register("unrolled", LoopUnroller().transform)
+
+        for name, fn in registry.get_enabled(config):
+            transformed = fn(original_spec)
+    """
+
+    def __init__(self) -> None:
+        # Internal dict: name -> callable
+        self._transforms: dict[str, Callable] = {}
+
+    def register(self, name: str, fn: Callable) -> None:
+        """Register a transformation under a given name."""
+        self._transforms[name] = fn
+
+    def get_enabled(self, config: Config) -> list[tuple[str, Callable]]:
+        """Return (name, fn) pairs for all transformations listed in config.
+
+        Raises KeyError if a name in config.enabled_transformations has not
+        been registered — fail loudly rather than silently skipping.
+        """
+        result = []
+        for name in config.enabled_transformations:
+            if name not in self._transforms:
+                raise KeyError(
+                    f"Transformation '{name}' is in ENABLED_TRANSFORMATIONS "
+                    f"but was never registered. Register it in main()."
+                )
+            result.append((name, self._transforms[name]))
+        return result
