@@ -20,9 +20,10 @@ from dataclasses import dataclass, field
 N_FUNCTIONS           = 1000
 SEED                  = 42        # fixed seed for reproducibility
 OUTPUT_DIR            = "output"
-ITERATION_COUNT_RANGE = (2, 16)   # how many times each loop runs
+ITERATION_COUNT_RANGE = (2, 64)   # wider range: short loops favour unrolling, long loops hurt code cache
+MAX_UNROLLED_STMTS    = 5000      # hard cap: if unrolling would exceed this many statements, keep the loop
 LOOP_COUNT_RANGE      = (1, 3)    # how many top-level loops per function
-NESTING_DEPTH_RANGE   = (1, 3)    # 1 = flat, 2 = one level of nesting, 3 = two levels of nesting
+NESTING_DEPTH_RANGE   = (1, 5)    # deeper nesting (up to 4 levels) produces large unrolled code, balancing the dataset
 
 # Which variants to write for every function.
 # "original" is always the identity (no transformation).
@@ -64,6 +65,7 @@ class Config:
     body_patterns:           list  = field(
         default_factory=lambda: list(BODY_PATTERNS)
     )
+    max_unrolled_stmts:      int   = MAX_UNROLLED_STMTS
 
 
 # ── Section 2: IR (Intermediate Representation) dataclasses ─────────────────
@@ -162,8 +164,8 @@ class FunctionSpec:
 import random as _random
 
 
-# Loop variable names assigned by nesting depth (depth 0 = i, 1 = j, 2 = k).
-_LOOP_VARS = ["i", "j", "k"]
+# Loop variable names assigned by nesting depth (depth 0 = i, 1 = j, ... 4 = m).
+_LOOP_VARS = ["i", "j", "k", "l", "m"]
 
 
 class FunctionGenerator:
@@ -202,9 +204,17 @@ class FunctionGenerator:
         depth=0 is the outermost loop. Each call may create an inner loop
         until the configured max nesting depth is reached.
         """
-        max_depth       = self._config.nesting_depth_range[1] - 1  # 0-indexed
-        iteration_count = self._rng.randint(*self._config.iteration_count_range)
-        variable        = _LOOP_VARS[depth]
+        max_depth = self._config.nesting_depth_range[1] - 1  # 0-indexed
+
+        # Scale the iteration count down as nesting gets deeper.
+        # Without this, a depth-5 loop with 128 iterations produces 128^5
+        # statements when unrolled, exhausting memory.
+        # Each depth level halves the max allowed iterations.
+        base_max  = self._config.iteration_count_range[1]
+        scaled_max = max(2, base_max // (2 ** depth))
+        iteration_count = self._rng.randint(self._config.iteration_count_range[0], scaled_max)
+
+        variable  = _LOOP_VARS[depth]
 
         # Pick a random body pattern for this loop level.
         # The pattern is chosen once per loop so all iterations share it.
@@ -268,11 +278,38 @@ class LoopUnroller:
     expanded first, then its parent, preserving correct iteration order.
     """
 
-    def transform(self, spec: FunctionSpec) -> FunctionSpec:
-        """Return a new FunctionSpec with all loops fully unrolled."""
+    def transform(self, spec: FunctionSpec, max_stmts: int = MAX_UNROLLED_STMTS) -> FunctionSpec:
+        """Return a new FunctionSpec with all loops fully unrolled.
+
+        If the estimated total unrolled statement count across all loops would
+        exceed max_stmts, the original spec is returned unchanged. This prevents
+        pathologically large files from being generated for deeply nested loops
+        with high iteration counts — which would exhaust memory and crash.
+
+        Returning the original unchanged is valid data for the ML model: it means
+        "this function was too complex to unroll" and the label will be "no benefit"
+        since original == unrolled in that case.
+        """
+        # Estimate total statements before doing any work.
+        estimated = sum(self._estimate_stmts(loop) for loop in spec.loops)
+        if estimated > max_stmts:
+            return spec  # too large — return original unchanged
+
         new_spec       = copy.deepcopy(spec)
         new_spec.loops = [self._unroll_loop(loop) for loop in new_spec.loops]
         return new_spec
+
+    def _estimate_stmts(self, loop: LoopSpec) -> int:
+        """Estimate how many statements unrolling this loop would produce.
+
+        Multiplies iteration counts down the nesting chain recursively.
+        Used as a cheap pre-check before actually unrolling.
+        """
+        body_count = len(loop.body)
+        if loop.inner_loop is not None:
+            inner_count = self._estimate_stmts(loop.inner_loop)
+            return loop.iteration_count * (body_count + inner_count)
+        return loop.iteration_count * max(body_count, 1)
 
     def _unroll_loop(self, loop: LoopSpec) -> LoopSpec:
         """Recursively unroll a loop and any inner loops.
