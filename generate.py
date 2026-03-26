@@ -231,3 +231,104 @@ class FunctionGenerator:
             body            = body,
             inner_loop      = inner_loop,
         )
+
+
+# ── Section 4: Transformations ───────────────────────────────────────────────
+# Each transformation is a class with a single transform() method:
+#     transform(spec: FunctionSpec) -> FunctionSpec
+#
+# Transformations must never mutate the input spec — always return a new one.
+# This keeps the original available for the "original.c" render and makes
+# transformations safe to compose in any order.
+#
+# Adding a new transformation (e.g. inlining, dead code elimination):
+#   1. Write a new class with a transform() method below.
+#   2. Register it in main() via registry.register("name", MyTransform().transform).
+#   3. Add "name" to ENABLED_TRANSFORMATIONS in Config.
+#   Nothing else needs to change.
+
+import copy
+
+
+class LoopUnroller:
+    """Unrolls every loop in a FunctionSpec by replacing it with explicit statements.
+
+    Unrolling removes loop overhead (counter increment, condition check, branch)
+    by writing out each iteration as a separate statement.
+
+    Example — original loop (iteration_count=3, variable="i"):
+        for (int i = 0; i < 3; i++) { sum += arr[i]; }
+
+    After unrolling:
+        sum += arr[0];
+        sum += arr[1];
+        sum += arr[2];
+
+    Nested loops are unrolled from the inside out: the innermost loop is
+    expanded first, then its parent, preserving correct iteration order.
+    """
+
+    def transform(self, spec: FunctionSpec) -> FunctionSpec:
+        """Return a new FunctionSpec with all loops fully unrolled."""
+        new_spec       = copy.deepcopy(spec)
+        new_spec.loops = [self._unroll_loop(loop) for loop in new_spec.loops]
+        return new_spec
+
+    def _unroll_loop(self, loop: LoopSpec) -> LoopSpec:
+        """Recursively unroll a loop and any inner loops.
+
+        Returns a LoopSpec with iteration_count=1 whose body contains all
+        the expanded statements. iteration_count=1 signals to the renderer
+        that this loop has been unrolled and should be emitted without a
+        for-loop wrapper.
+        """
+        if loop.inner_loop is not None:
+            # Unroll the inner loop first, then unroll this level around it.
+            unrolled_inner = self._unroll_loop(loop.inner_loop)
+            inner_stmts    = self._expand(unrolled_inner)
+        else:
+            inner_stmts = []
+
+        # Expand this loop's own body statements across all iterations.
+        expanded_body = self._expand_statements(loop.body, loop.variable, loop.iteration_count)
+
+        # Combine: for each iteration of this loop, emit body then inner stmts.
+        all_stmts = []
+        for i in range(loop.iteration_count):
+            # Substitute the current iteration index into body statements.
+            for stmt in loop.body:
+                substituted = stmt.template.replace(f"{{{loop.variable}}}", str(i))
+                all_stmts.append(Statement(substituted))
+            # Append inner loop statements (already fully expanded).
+            all_stmts.extend(inner_stmts)
+
+        # Return a degenerate LoopSpec (iteration_count=1) carrying flat statements.
+        # The renderer checks iteration_count=1 + no inner_loop to skip the for-wrapper.
+        return LoopSpec(
+            variable        = loop.variable,
+            iteration_count = 1,
+            body            = all_stmts,
+            inner_loop      = None,
+        )
+
+    def _expand(self, loop: LoopSpec) -> list[Statement]:
+        """Flatten a fully-unrolled LoopSpec into a plain list of statements."""
+        return loop.body
+
+    def _expand_statements(
+        self,
+        stmts: list[Statement],
+        variable: str,
+        count: int,
+    ) -> list[Statement]:
+        """Substitute variable with each index 0..count-1 across all statements.
+
+        Not used directly in _unroll_loop but available for future transformations
+        that need to expand a statement list independently.
+        """
+        result = []
+        for i in range(count):
+            for stmt in stmts:
+                substituted = stmt.template.replace(f"{{{variable}}}", str(i))
+                result.append(Statement(substituted))
+        return result
