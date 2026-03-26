@@ -8,3 +8,9 @@ results.csv
 *.o
 *.out
 a.out
+
+# Trained model files — regeneratable with train_rf_xgb.py
+model/*.pkl
+
+# Dataset — regeneratable with extract.py
+dataset.csv
