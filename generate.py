@@ -332,3 +332,81 @@ class LoopUnroller:
                 substituted = stmt.template.replace(f"{{{variable}}}", str(i))
                 result.append(Statement(substituted))
         return result
+
+
+# ── Section 5: CRenderer ─────────────────────────────────────────────────────
+# Turns a FunctionSpec into a C source string.
+# Knows C syntax and indentation. Knows nothing about files, transformations,
+# or random generation. Stateless — same spec always produces the same text.
+
+INDENT = "    "  # 4 spaces per indentation level
+
+
+class CRenderer:
+    """Renders a FunctionSpec as a valid C source string.
+
+    Handles:
+      - Function signature with parameters
+      - Result variable declaration and return
+      - Nested for-loops at arbitrary depth
+      - Unrolled loops (iteration_count=1, no inner_loop) emitted as flat statements
+    """
+
+    def render(self, spec: FunctionSpec) -> str:
+        """Return a complete C source string for the given FunctionSpec."""
+        lines = []
+
+        # -- function signature --
+        params = ", ".join(f"{p.c_type} {p.name}" for p in spec.parameters)
+        lines.append(f"{spec.return_type} {spec.name}({params}) {{")
+
+        # -- declare and zero the accumulator --
+        lines.append(f"{INDENT}int {spec.result_var} = 0;")
+        lines.append("")
+
+        # -- render each top-level loop sequentially --
+        for loop in spec.loops:
+            loop_lines = self._render_loop(loop, depth=1)
+            lines.extend(loop_lines)
+            lines.append("")
+
+        # -- return the accumulated result --
+        lines.append(f"{INDENT}return {spec.result_var};")
+        lines.append("}")
+
+        return "\n".join(lines)
+
+    def _render_loop(self, loop: LoopSpec, depth: int) -> list[str]:
+        """Recursively render a loop and its body at the given indentation depth.
+
+        If the loop has iteration_count=1 and no inner_loop, it was produced by
+        LoopUnroller and should be emitted as flat statements (no for-wrapper).
+        Otherwise it is rendered as a standard for-loop.
+        """
+        indent = INDENT * depth
+        lines  = []
+
+        is_unrolled = (loop.iteration_count == 1 and loop.inner_loop is None)
+
+        if is_unrolled:
+            # Emit the pre-expanded statements directly, no for-loop wrapper.
+            for stmt in loop.body:
+                lines.append(f"{indent}{stmt.template}")
+        else:
+            # Emit a standard for-loop.
+            var   = loop.variable
+            count = loop.iteration_count
+            lines.append(f"{indent}for (int {var} = 0; {var} < {count}; {var}++) {{")
+
+            # Render body statements at the next indentation level.
+            for stmt in loop.body:
+                lines.append(f"{indent}{INDENT}{stmt.template}")
+
+            # Render the inner loop recursively if present.
+            if loop.inner_loop is not None:
+                inner_lines = self._render_loop(loop.inner_loop, depth + 1)
+                lines.extend(inner_lines)
+
+            lines.append(f"{indent}}}")
+
+        return lines
