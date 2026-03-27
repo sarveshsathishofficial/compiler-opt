@@ -97,19 +97,22 @@ def load_dataset(path: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
 
 def build_random_forest() -> RandomForestClassifier:
     return RandomForestClassifier(
-        n_estimators = 200,
-        max_depth    = None,
-        class_weight = "balanced",
-        random_state = RANDOM_STATE,
-        n_jobs       = -1,
+        n_estimators     = 200,
+        max_depth        = 10,   # was None — unlimited depth memorises training data
+        min_samples_leaf = 5,    # don't split a node if it has fewer than 5 samples
+        class_weight     = "balanced",
+        random_state     = RANDOM_STATE,
+        n_jobs           = -1,
     )
 
 
 def build_xgboost(scale_pos_weight: float) -> xgb.XGBClassifier:
     return xgb.XGBClassifier(
         n_estimators     = 200,
-        max_depth        = 6,
-        learning_rate    = 0.1,
+        max_depth        = 4,    # was 6 — shallower trees generalise better with few features
+        learning_rate    = 0.05, # was 0.1 — slower learning reduces overfitting
+        subsample        = 0.8,  # train each tree on 80% of samples — reduces memorisation
+        colsample_bytree = 0.8,  # use 80% of features per tree — reduces memorisation
         scale_pos_weight = scale_pos_weight,
         eval_metric      = "logloss",
         random_state     = RANDOM_STATE,
