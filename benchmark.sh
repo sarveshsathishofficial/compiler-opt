@@ -66,47 +66,50 @@ for func_dir in "$OUTPUT_DIR"/func_*/; do
         binary="${c_file%.c}"
 
         # ── Build a self-timing harness around the generated function ─────
-        # The generated .c file contains only the function definition.
-        # We compile it together with an inline main() that:
-        #   1. initialises arr[] with dummy data
-        #   2. calls the function inside a timed loop
-        #   3. prints the elapsed nanoseconds
-        #
-        # volatile sink prevents the compiler from optimising away the call.
+        # Use Python to generate the harness file — avoids all bash string
+        # escaping issues with special characters in C source (backslashes,
+        # percent signs, quotes). Python writes the file verbatim with no
+        # shell interpolation surprises.
 
-        harness=$(cat <<HARNESS
+        harness_file=$(mktemp /tmp/harness_XXXXXX.c)
+
+        python3 - "$c_file" "$func_name" "$ARRAY_SIZE" "$harness_file" <<'PYEOF'
+import sys
+
+c_file, func_name, array_size, out_file = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+
+with open(c_file) as f:
+    c_source = f.read()
+
+harness = f"""\
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
 
-$(cat "$c_file")
+{c_source}
 
-int main(void) {
-    int arr[$ARRAY_SIZE];
-    /* fill array with non-zero data so operations are meaningful */
-    for (int i = 0; i < $ARRAY_SIZE; i++) arr[i] = i + 1;
-
-    /* warm up: run once before timing to prime caches */
-    volatile int sink = ${func_name}(arr, $ARRAY_SIZE);
-
+int main(void) {{
+    int arr[{array_size}];
+    for (int i = 0; i < {array_size}; i++) arr[i] = i + 1;
+    volatile int sink = {func_name}(arr, {array_size});
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-
-    sink = ${func_name}(arr, $ARRAY_SIZE);
-
+    sink = {func_name}(arr, {array_size});
     clock_gettime(CLOCK_MONOTONIC, &end);
-
     long ns = (end.tv_sec - start.tv_sec) * 1000000000L
             + (end.tv_nsec - start.tv_nsec);
-    printf("%ld\n", ns);
-
-    /* use sink so the compiler cannot eliminate the function call */
+    printf("%ld\\n", ns);
     return (int)(sink & 0);
-}
-HARNESS
-)
-        # Compile the harness to a temporary binary.
-        echo "$harness" | $CC $CFLAGS -x c - -o "$binary" -lm
+}}
+"""
+
+with open(out_file, "w") as f:
+    f.write(harness)
+PYEOF
+
+        # Compile and clean up temp file.
+        $CC $CFLAGS "$harness_file" -o "$binary" -lm
+        rm -f "$harness_file"
 
         # Time the binary and record the median.
         median=$(time_binary "$binary")
