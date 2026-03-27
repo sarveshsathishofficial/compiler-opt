@@ -29,19 +29,30 @@ from generate import (
 # ── Feature extraction ───────────────────────────────────────────────────────
 
 def extract_features(spec: FunctionSpec) -> dict:
-    """Extract structural features from a FunctionSpec.
+    """Extract structural and body-level features from a FunctionSpec.
 
     Returns a flat dict suitable for one CSV row.
 
-    Current features (Phase 1 — loop structure only):
+    Phase 1 — loop structure features:
         loop_count            number of top-level loops
         total_loop_count      total loops including all nested levels
         max_nesting_depth     deepest nesting level across all loops
         max_iteration_count   highest single-loop trip count
         avg_iteration_count   mean trip count across all loops
         total_iter_product    product of all trip counts (proxy for unrolled size)
-        has_dependent_body    1 if any loop body uses += or *= (data dependency)
-        has_independent_body  1 if any loop body is an independent transformation
+
+    Phase 2 — body-level features (what happens inside each iteration):
+        has_reduction         1 if any stmt accumulates into a scalar (sum += ...)
+                              — creates data dependency between iterations,
+                                limits how much the CPU can parallelise after unrolling
+        array_reads_per_iter  avg array reads per iteration across all loops
+                              — more reads = more memory pressure after unrolling
+        array_writes_per_iter avg array writes per iteration across all loops
+                              — writes force cache coherency, hurt parallelism
+        has_multiply          1 if any body contains multiplication
+                              — multiply is more expensive than add on most CPUs
+        total_body_stmts      total statements across all loop bodies
+                              — proxy for code size after unrolling
     """
     all_loops = _collect_all_loops(spec)
 
@@ -50,20 +61,55 @@ def extract_features(spec: FunctionSpec) -> dict:
     for c in iteration_counts:
         total_product *= c
 
-    # Detect body pattern types across all loops.
+    # Collect all body statements across every loop.
     all_stmts = [stmt for loop in all_loops for stmt in loop.body]
-    has_dependent   = int(any("+=" in s.template or "*=" in s.template for s in all_stmts))
-    has_independent = int(any("+=" not in s.template and "*=" not in s.template for s in all_stmts))
+
+    # ── Body-level features ───────────────────────────────────────────────────
+
+    # has_reduction: scalar accumulation creates inter-iteration data dependency.
+    # Pattern: variable that is NOT arr[...] appears on the left of +=  or *=
+    # Simple heuristic: if += or *= is present and left side doesn't start with "arr"
+    has_reduction = int(any(
+        ("+=" in s.template or "*=" in s.template)
+        and not s.template.strip().startswith("arr")
+        for s in all_stmts
+    ))
+
+    # array_reads_per_iter: count "arr[" occurrences per statement, averaged.
+    # Each "arr[" on the right side of an assignment is one read.
+    reads_per_stmt = [s.template.count("arr[") for s in all_stmts]
+    array_reads_per_iter = round(
+        sum(reads_per_stmt) / len(reads_per_stmt) if reads_per_stmt else 0, 2
+    )
+
+    # array_writes_per_iter: "arr[...] =" pattern indicates a write.
+    # Simple check: statement starts with "arr" (left-hand side is array element).
+    writes_per_stmt = [int(s.template.strip().startswith("arr")) for s in all_stmts]
+    array_writes_per_iter = round(
+        sum(writes_per_stmt) / len(writes_per_stmt) if writes_per_stmt else 0, 2
+    )
+
+    # has_multiply: multiplication is costlier than addition.
+    # Check for * that is not part of *= (which is already captured by has_reduction).
+    has_multiply = int(any("*" in s.template for s in all_stmts))
+
+    # total_body_stmts: proxy for how large the unrolled code will be.
+    total_body_stmts = len(all_stmts)
 
     return {
-        "loop_count":           len(spec.loops),
-        "total_loop_count":     len(all_loops),
-        "max_nesting_depth":    _max_depth(spec),
-        "max_iteration_count":  max(iteration_counts),
-        "avg_iteration_count":  round(sum(iteration_counts) / len(iteration_counts), 2),
-        "total_iter_product":   total_product,
-        "has_dependent_body":   has_dependent,
-        "has_independent_body": has_independent,
+        # Phase 1 — loop structure
+        "loop_count":            len(spec.loops),
+        "total_loop_count":      len(all_loops),
+        "max_nesting_depth":     _max_depth(spec),
+        "max_iteration_count":   max(iteration_counts),
+        "avg_iteration_count":   round(sum(iteration_counts) / len(iteration_counts), 2),
+        "total_iter_product":    total_product,
+        # Phase 2 — body level
+        "has_reduction":         has_reduction,
+        "array_reads_per_iter":  array_reads_per_iter,
+        "array_writes_per_iter": array_writes_per_iter,
+        "has_multiply":          has_multiply,
+        "total_body_stmts":      total_body_stmts,
     }
 
 
@@ -124,14 +170,19 @@ RESULTS_PATH = "results.csv"
 DATASET_PATH = "dataset.csv"
 
 FEATURE_COLUMNS = [
+    # Phase 1 — loop structure
     "loop_count",
     "total_loop_count",
     "max_nesting_depth",
     "max_iteration_count",
     "avg_iteration_count",
     "total_iter_product",
-    "has_dependent_body",
-    "has_independent_body",
+    # Phase 2 — body level
+    "has_reduction",
+    "array_reads_per_iter",
+    "array_writes_per_iter",
+    "has_multiply",
+    "total_body_stmts",
 ]
 
 

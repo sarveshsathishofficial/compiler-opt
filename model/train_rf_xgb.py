@@ -59,14 +59,19 @@ DEFAULT_THRESHOLD = 0.5
 GPU_DEVICE = "cpu"  # set to "cuda" for AMD GPU with ROCm
 
 FEATURE_COLUMNS = [
+    # Phase 1 — loop structure
     "loop_count",
     "total_loop_count",
     "max_nesting_depth",
     "max_iteration_count",
     "avg_iteration_count",
-    "total_iter_product",   # log-transformed below
-    "has_dependent_body",
-    "has_independent_body",
+    "total_iter_product",       # log-transformed below
+    # Phase 2 — body level
+    "has_reduction",
+    "array_reads_per_iter",
+    "array_writes_per_iter",
+    "has_multiply",
+    "total_body_stmts",
 ]
 LABEL_COLUMN = "unrolled_faster"
 
