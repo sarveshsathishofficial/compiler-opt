@@ -31,10 +31,26 @@ NESTING_DEPTH_RANGE   = (1, 5)    # deeper nesting (up to 4 levels) produces lar
 # almost always wins, causing severe class imbalance (83/17 on 1000 samples).
 HARD_EXAMPLE_RATIO    = 0.35      # 35% of functions are forced hard cases
 
+# Fraction of functions that include a helper function call in their loop body.
+# These functions test inlining decisions. The other 50% have no helper call
+# and their inlined variant is identical to the original.
+HELPER_CALL_RATIO     = 0.5
+
+# Expressions used as helper function bodies.
+# {x} is replaced with the parameter name at render time.
+# Chosen to cover common patterns: scaling, combining, branching cost.
+HELPER_BODY_EXPRS = [
+    "{x} * 2",           # simple scaling
+    "{x} * 2 + 1",       # multiply-add
+    "{x} * {x}",         # squaring — more expensive
+    "{x} + ({x} >> 1)",  # scale by 1.5 using shift
+    "{x} * 3 - 1",       # multiply-subtract
+]
+
 # Which variants to write for every function.
 # "original" is always the identity (no transformation).
 # Add new transformation names here once they are registered in main().
-ENABLED_TRANSFORMATIONS = ["original", "unrolled"]
+ENABLED_TRANSFORMATIONS = ["original", "unrolled", "inlined", "unrolled_inlined"]
 
 # Body patterns used inside loop iterations.
 # {var} is replaced with the loop variable at render/unroll time.
@@ -73,6 +89,10 @@ class Config:
     )
     max_unrolled_stmts:      int   = MAX_UNROLLED_STMTS
     hard_example_ratio:      float = HARD_EXAMPLE_RATIO
+    helper_call_ratio:       float = HELPER_CALL_RATIO
+    helper_body_exprs:       list  = field(
+        default_factory=lambda: list(HELPER_BODY_EXPRS)
+    )
 
 
 # ── Section 2: IR (Intermediate Representation) dataclasses ─────────────────
@@ -140,6 +160,29 @@ class ParameterSpec:
 
 
 @dataclass
+class HelperSpec:
+    """A small helper function called from inside a loop body.
+
+    The helper takes a single int argument and returns an int.
+    Its body is a single return statement expressed as a template,
+    where {x} is replaced with the argument name at render time.
+
+    Example:
+        HelperSpec(name="helper_0042", param="x", body_expr="{x} * 2 + 1")
+        renders as:
+            int helper_0042(int x) { return x * 2 + 1; }
+        and is called as:
+            sum += helper_0042(arr[i]);
+
+    Inlining replaces the call with the body expression directly:
+            sum += arr[i] * 2 + 1;
+    """
+    name:      str
+    param:     str        # parameter name inside the helper, e.g. "x"
+    body_expr: str        # return expression template, e.g. "{x} * 2 + 1"
+
+
+@dataclass
 class FunctionSpec:
     """Top-level representation of a complete C function.
 
@@ -153,12 +196,14 @@ class FunctionSpec:
         return_type: C return type, e.g. "int"
         parameters:  ordered list of function parameters
         loops:       top-level loops executed sequentially in the function body
+        helpers:     helper functions called from loop bodies (may be empty)
         result_var:  name of the variable accumulated and returned
     """
     name:        str
     return_type: str
     parameters:  list[ParameterSpec] = field(default_factory=list)
     loops:       list[LoopSpec]      = field(default_factory=list)
+    helpers:     list[HelperSpec]    = field(default_factory=list)
     result_var:  str                 = "sum"  # name of the accumulator variable (e.g. sum += arr[i]); overridable per function
 
 
@@ -195,11 +240,25 @@ class FunctionGenerator:
         depth and the upper half of the iteration count range. These functions
         are very likely to exceed MAX_UNROLLED_STMTS and produce label=0,
         balancing the dataset against the natural majority of easy-to-unroll loops.
+
+        HELPER_CALL_RATIO % of functions include a helper function call in their
+        loop body to generate inlining training examples.
         """
-        name     = f"func_{index:04d}"
-        is_hard  = self._rng.random() < self._config.hard_example_ratio
-        loops    = [self._make_loop(depth=0, force_deep=is_hard) for _ in
-                    range(self._rng.randint(*self._config.loop_count_range))]
+        name       = f"func_{index:04d}"
+        is_hard    = self._rng.random() < self._config.hard_example_ratio
+        has_helper = self._rng.random() < self._config.helper_call_ratio
+
+        # Generate a helper function if needed, before making loops so the
+        # loop body template can reference it by name.
+        helpers = []
+        if has_helper:
+            helper = self._make_helper(index)
+            helpers.append(helper)
+
+        loops = [
+            self._make_loop(depth=0, force_deep=is_hard, helper=helpers[0] if helpers else None)
+            for _ in range(self._rng.randint(*self._config.loop_count_range))
+        ]
 
         return FunctionSpec(
             name        = name,
@@ -209,10 +268,20 @@ class FunctionGenerator:
                 ParameterSpec("n",   "int"),
             ],
             loops      = loops,
+            helpers    = helpers,
             result_var = "sum",
         )
 
-    def _make_loop(self, depth: int, force_deep: bool = False) -> LoopSpec:
+    def _make_helper(self, func_index: int) -> HelperSpec:
+        """Generate a small helper function for this function."""
+        body_expr = self._rng.choice(self._config.helper_body_exprs)
+        return HelperSpec(
+            name      = f"helper_{func_index:04d}",
+            param     = "x",
+            body_expr = body_expr,
+        )
+
+    def _make_loop(self, depth: int, force_deep: bool = False, helper: "HelperSpec | None" = None) -> LoopSpec:
         """Recursively build a loop, nesting down to a random max depth.
 
         depth=0 is the outermost loop. Each call may create an inner loop
@@ -240,21 +309,29 @@ class FunctionGenerator:
             )
 
         variable = _LOOP_VARS[depth]
-        pattern  = self._rng.choice(self._config.body_patterns)
+
+        # If a helper is provided, the innermost loop body calls it instead
+        # of using a raw arithmetic pattern. Outer levels still nest deeper.
+        if helper is not None:
+            # Helper call template: sum += helper_NNNN(arr[{var}]);
+            body_template = f"sum += {helper.name}(arr[{{{variable}}}]);"
+        else:
+            pattern       = self._rng.choice(self._config.body_patterns)
+            body_template = pattern.replace("{var}", f"{{{variable}}}")
 
         # At the innermost level, add the actual work statement.
         # At outer levels, the body is empty — work happens in the inner loop.
         if depth >= max_depth:
-            body       = [Statement(pattern.replace("{var}", f"{{{variable}}}"))]
+            body       = [Statement(body_template)]
             inner_loop = None
         else:
             # Hard examples always nest deeper; normal examples decide randomly.
             go_deeper = force_deep or (self._rng.random() < 0.5)
             if go_deeper:
                 body       = []
-                inner_loop = self._make_loop(depth + 1, force_deep=force_deep)
+                inner_loop = self._make_loop(depth + 1, force_deep=force_deep, helper=helper)
             else:
-                body       = [Statement(pattern.replace("{var}", f"{{{variable}}}"))]
+                body       = [Statement(body_template)]
                 inner_loop = None
 
         return LoopSpec(
@@ -393,6 +470,73 @@ class LoopUnroller:
         return result
 
 
+class FunctionInliner:
+    """Replaces helper function calls in loop bodies with the helper's body expression.
+
+    Inlining removes the overhead of a function call (stack setup, jump, return)
+    by substituting the callee's code directly at the call site.
+
+    Example — original call statement:
+        sum += helper_0042(arr[i]);
+
+    After inlining (helper body_expr = "{x} * 2 + 1", param = "x"):
+        sum += arr[i] * 2 + 1;
+
+    Only statements that contain a known helper call are modified.
+    Statements without helper calls are passed through unchanged.
+    Functions with no helpers are returned as-is (identity transform).
+    """
+
+    def transform(self, spec: FunctionSpec) -> FunctionSpec:
+        """Return a new FunctionSpec with all helper calls inlined."""
+        if not spec.helpers:
+            return spec  # no helpers — nothing to inline
+
+        new_spec       = copy.deepcopy(spec)
+        # Build a lookup of helper name -> HelperSpec for fast access.
+        helper_map     = {h.name: h for h in new_spec.helpers}
+        new_spec.loops = [self._inline_loop(loop, helper_map) for loop in new_spec.loops]
+        return new_spec
+
+    def _inline_loop(self, loop: LoopSpec, helper_map: dict) -> LoopSpec:
+        """Recursively inline helper calls in this loop and any inner loops."""
+        new_body = [self._inline_stmt(stmt, helper_map) for stmt in loop.body]
+        new_inner = self._inline_loop(loop.inner_loop, helper_map) if loop.inner_loop else None
+        return LoopSpec(
+            variable        = loop.variable,
+            iteration_count = loop.iteration_count,
+            body            = new_body,
+            inner_loop      = new_inner,
+        )
+
+    def _inline_stmt(self, stmt: Statement, helper_map: dict) -> Statement:
+        """Replace a helper call in a statement with the helper's body expression.
+
+        Matches pattern: sum += helper_NNNN(arr[...]);
+        Replaces with:   sum += <body_expr with arr[...] substituted for {x}>;
+        """
+        template = stmt.template
+        for helper_name, helper in helper_map.items():
+            call_prefix = f"{helper_name}("
+            if call_prefix not in template:
+                continue
+
+            # Extract the argument passed to the helper (everything between
+            # the opening and closing parenthesis of the call).
+            start = template.index(call_prefix) + len(call_prefix)
+            end   = template.index(")", start)
+            arg   = template[start:end]
+
+            # Substitute the argument for {x} in the helper body expression.
+            inlined_expr = helper.body_expr.replace(f"{{{helper.param}}}", arg)
+
+            # Replace the full call expression with the inlined expression.
+            call_expr    = f"{call_prefix}{arg})"
+            template     = template.replace(call_expr, inlined_expr)
+
+        return Statement(template)
+
+
 # ── Section 5: CRenderer ─────────────────────────────────────────────────────
 # Turns a FunctionSpec into a C source string.
 # Knows C syntax and indentation. Knows nothing about files, transformations,
@@ -412,8 +556,20 @@ class CRenderer:
     """
 
     def render(self, spec: FunctionSpec) -> str:
-        """Return a complete C source string for the given FunctionSpec."""
+        """Return a complete C source string for the given FunctionSpec.
+
+        Helper functions (if any) are rendered above the main function so the
+        compiler sees their definitions before the call sites.
+        After inlining, helpers are still present in spec.helpers but the call
+        sites in loop bodies have been replaced — the helper definitions are
+        still emitted so the file compiles without errors even if unused.
+        """
         lines = []
+
+        # -- render helper function definitions first --
+        for helper in spec.helpers:
+            lines.append(self._render_helper(helper))
+            lines.append("")
 
         # -- function signature --
         params = ", ".join(f"{p.c_type} {p.name}" for p in spec.parameters)
@@ -470,6 +626,17 @@ class CRenderer:
             lines.append(f"{indent}}}")
 
         return lines
+
+    def _render_helper(self, helper: HelperSpec) -> str:
+        """Render a helper function as a single-line C definition.
+
+        Rendered as an inline function so the compiler can inline it even
+        when we haven't explicitly applied the FunctionInliner transformation,
+        giving a fair comparison at -O0 (where inline hints are ignored but
+        the function definition is available).
+        """
+        body = helper.body_expr.replace(f"{{{helper.param}}}", helper.param)
+        return f"int {helper.name}(int {helper.param}) {{ return {body}; }}"
 
 
 # ── Section 6: OutputWriter ──────────────────────────────────────────────────
@@ -575,12 +742,18 @@ def main() -> None:
     writer   = OutputWriter(config, renderer)
     gen      = FunctionGenerator(config, rng)
 
-    # Register transformations.
+    # Register all 4 transformation combinations.
     # "original" is always the identity — no changes, just renders as-is.
-    # Add new transformations here as the project grows.
+    # Composed transforms apply unrolling and inlining in the correct order:
+    #   unroll first, then inline — unrolling exposes more call sites for inlining.
+    unroller = LoopUnroller()
+    inliner  = FunctionInliner()
+
     registry = TransformationRegistry()
-    registry.register("original", lambda s: s)
-    registry.register("unrolled", LoopUnroller().transform)
+    registry.register("original",        lambda s: s)
+    registry.register("unrolled",        unroller.transform)
+    registry.register("inlined",         inliner.transform)
+    registry.register("unrolled_inlined", lambda s: inliner.transform(unroller.transform(s)))
 
     enabled = registry.get_enabled(config)
 
