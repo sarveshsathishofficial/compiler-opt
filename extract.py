@@ -1,6 +1,6 @@
 # extract.py
-# Extracts structural features from each generated FunctionSpec and joins
-# them with benchmark results to produce a labeled dataset for ML training.
+# Extracts structural and body-level features from each generated FunctionSpec
+# and joins them with benchmark results to produce a labeled dataset for ML training.
 #
 # Why extract from the IR rather than parsing C files?
 #   The FunctionSpec tree already contains everything we need. Parsing the
@@ -8,32 +8,42 @@
 #   we already have. Re-running the generator with the same seed reproduces
 #   identical specs deterministically.
 #
-# Output: dataset.csv
-#   One row per function. Columns: structural features + label (unrolled_faster).
+# Label (multi-class):
+#   0 = original is fastest
+#   1 = unrolled is fastest
+#   2 = inlined is fastest
+#   3 = unrolled_inlined is fastest
 #
-# Phase 2 note:
-#   Current features describe loop structure only. Future phases should add
-#   body-level features (data dependency type, memory access pattern, op count)
-#   so the model generalises to unseen loop bodies.
+# Output: dataset.csv
+#   One row per function. Columns: features + best_transformation label.
 
 # ── Imports ──────────────────────────────────────────────────────────────────
 
 import csv
 import random
 from generate import (
-    Config, FunctionGenerator, FunctionSpec, LoopSpec, Statement,
+    Config, FunctionGenerator, FunctionSpec, LoopSpec, Statement, HelperSpec,
     MAX_UNROLLED_STMTS, LoopUnroller,
 )
+
+# Maps transformation name to integer class label.
+LABEL_MAP = {
+    "original":        0,
+    "unrolled":        1,
+    "inlined":         2,
+    "unrolled_inlined": 3,
+}
+LABEL_NAMES = {v: k for k, v in LABEL_MAP.items()}
 
 
 # ── Feature extraction ───────────────────────────────────────────────────────
 
 def extract_features(spec: FunctionSpec) -> dict:
-    """Extract structural and body-level features from a FunctionSpec.
+    """Extract structural, body-level, and inlining features from a FunctionSpec.
 
     Returns a flat dict suitable for one CSV row.
 
-    Phase 1 — loop structure features:
+    Phase 1 — loop structure:
         loop_count            number of top-level loops
         total_loop_count      total loops including all nested levels
         max_nesting_depth     deepest nesting level across all loops
@@ -41,18 +51,19 @@ def extract_features(spec: FunctionSpec) -> dict:
         avg_iteration_count   mean trip count across all loops
         total_iter_product    product of all trip counts (proxy for unrolled size)
 
-    Phase 2 — body-level features (what happens inside each iteration):
-        has_reduction         1 if any stmt accumulates into a scalar (sum += ...)
-                              — creates data dependency between iterations,
-                                limits how much the CPU can parallelise after unrolling
-        array_reads_per_iter  avg array reads per iteration across all loops
-                              — more reads = more memory pressure after unrolling
-        array_writes_per_iter avg array writes per iteration across all loops
-                              — writes force cache coherency, hurt parallelism
+    Phase 2 — body level:
+        has_reduction         1 if any stmt accumulates into a scalar (data dependency)
+        array_reads_per_iter  avg array reads per iteration
+        array_writes_per_iter avg array writes per iteration
         has_multiply          1 if any body contains multiplication
-                              — multiply is more expensive than add on most CPUs
         total_body_stmts      total statements across all loop bodies
-                              — proxy for code size after unrolling
+
+    Phase 2 — inlining features:
+        has_function_call     1 if any loop body calls a helper function
+        num_helpers           number of distinct helper functions defined
+        helper_body_ops       total operator count across all helper body expressions
+                              — proxy for how expensive inlining each call is
+        call_count            total number of helper call statements in all loop bodies
     """
     all_loops = _collect_all_loops(spec)
 
@@ -61,40 +72,48 @@ def extract_features(spec: FunctionSpec) -> dict:
     for c in iteration_counts:
         total_product *= c
 
-    # Collect all body statements across every loop.
     all_stmts = [stmt for loop in all_loops for stmt in loop.body]
 
     # ── Body-level features ───────────────────────────────────────────────────
 
-    # has_reduction: scalar accumulation creates inter-iteration data dependency.
-    # Pattern: variable that is NOT arr[...] appears on the left of +=  or *=
-    # Simple heuristic: if += or *= is present and left side doesn't start with "arr"
     has_reduction = int(any(
         ("+=" in s.template or "*=" in s.template)
         and not s.template.strip().startswith("arr")
         for s in all_stmts
     ))
 
-    # array_reads_per_iter: count "arr[" occurrences per statement, averaged.
-    # Each "arr[" on the right side of an assignment is one read.
-    reads_per_stmt = [s.template.count("arr[") for s in all_stmts]
+    reads_per_stmt       = [s.template.count("arr[") for s in all_stmts]
     array_reads_per_iter = round(
         sum(reads_per_stmt) / len(reads_per_stmt) if reads_per_stmt else 0, 2
     )
 
-    # array_writes_per_iter: "arr[...] =" pattern indicates a write.
-    # Simple check: statement starts with "arr" (left-hand side is array element).
-    writes_per_stmt = [int(s.template.strip().startswith("arr")) for s in all_stmts]
+    writes_per_stmt       = [int(s.template.strip().startswith("arr")) for s in all_stmts]
     array_writes_per_iter = round(
         sum(writes_per_stmt) / len(writes_per_stmt) if writes_per_stmt else 0, 2
     )
 
-    # has_multiply: multiplication is costlier than addition.
-    # Check for * that is not part of *= (which is already captured by has_reduction).
-    has_multiply = int(any("*" in s.template for s in all_stmts))
-
-    # total_body_stmts: proxy for how large the unrolled code will be.
+    has_multiply     = int(any("*" in s.template for s in all_stmts))
     total_body_stmts = len(all_stmts)
+
+    # ── Inlining features ─────────────────────────────────────────────────────
+
+    # has_function_call: any loop body statement calls a helper.
+    # Detected by presence of "(" in statement template (all calls use parens).
+    has_function_call = int(any("(" in s.template for s in all_stmts))
+
+    # num_helpers: number of distinct helper functions in this spec.
+    num_helpers = len(spec.helpers)
+
+    # helper_body_ops: count operators (+, -, *, /, >>, <<) in each helper body.
+    # More operators = more work inlined per call site = more potential benefit.
+    ops = set("+-*/<>")
+    helper_body_ops = sum(
+        sum(1 for ch in h.body_expr if ch in ops)
+        for h in spec.helpers
+    )
+
+    # call_count: how many statements across all loops are helper calls.
+    call_count = sum(1 for s in all_stmts if "(" in s.template)
 
     return {
         # Phase 1 — loop structure
@@ -110,6 +129,11 @@ def extract_features(spec: FunctionSpec) -> dict:
         "array_writes_per_iter": array_writes_per_iter,
         "has_multiply":          has_multiply,
         "total_body_stmts":      total_body_stmts,
+        # Phase 2 — inlining
+        "has_function_call":     has_function_call,
+        "num_helpers":           num_helpers,
+        "helper_body_ops":       helper_body_ops,
+        "call_count":            call_count,
     }
 
 
@@ -142,11 +166,18 @@ def _loop_depth(loop: LoopSpec, current: int = 1) -> int:
 
 # ── Label loading ─────────────────────────────────────────────────────────────
 
-def load_labels(results_path: str) -> dict[str, int]:
-    """Load benchmark results and compute per-function label.
+# All transformation variants we expect in results.csv.
+ALL_TRANSFORMATIONS = ["original", "unrolled", "inlined", "unrolled_inlined"]
 
-    Label = 1 if unrolled variant was strictly faster than original.
-    Label = 0 if same speed or slower (not worth unrolling).
+
+def load_labels(results_path: str) -> dict[str, int]:
+    """Load benchmark results and compute the best transformation per function.
+
+    Label = integer class of whichever variant had the lowest median runtime:
+        0 = original, 1 = unrolled, 2 = inlined, 3 = unrolled_inlined
+
+    Ties are broken by preferring the simpler transformation (lower label index)
+    to avoid rewarding unnecessary complexity.
 
     Returns dict: func_name -> label
     """
@@ -157,9 +188,13 @@ def load_labels(results_path: str) -> dict[str, int]:
 
     labels = {}
     for func_name, variants in timings.items():
-        if "original" not in variants or "unrolled" not in variants:
+        # Only label functions that have all 4 variants measured.
+        if not all(t in variants for t in ALL_TRANSFORMATIONS):
             continue
-        labels[func_name] = int(variants["unrolled"] < variants["original"])
+
+        # Find the transformation with the lowest runtime.
+        best_name = min(ALL_TRANSFORMATIONS, key=lambda t: variants[t])
+        labels[func_name] = LABEL_MAP[best_name]
 
     return labels
 
@@ -183,6 +218,11 @@ FEATURE_COLUMNS = [
     "array_writes_per_iter",
     "has_multiply",
     "total_body_stmts",
+    # Phase 2 — inlining
+    "has_function_call",
+    "num_helpers",
+    "helper_body_ops",
+    "call_count",
 ]
 
 
@@ -202,34 +242,32 @@ def main() -> None:
         label     = labels.get(func_name)
 
         if label is None:
-            # No benchmark result for this function — skip it.
             continue
 
-        row = {"func_name": func_name, **features, "unrolled_faster": label}
+        row = {"func_name": func_name, **features, "best_transformation": label}
         rows.append(row)
 
-    # Write dataset.csv
-    fieldnames = ["func_name"] + FEATURE_COLUMNS + ["unrolled_faster"]
+    fieldnames = ["func_name"] + FEATURE_COLUMNS + ["best_transformation"]
     with open(DATASET_PATH, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
     print(f"Wrote {len(rows)} rows to {DATASET_PATH}")
-
-    # Print a quick feature summary so the user can sanity-check the output.
     _print_summary(rows)
 
 
 def _print_summary(rows: list[dict]) -> None:
-    """Print basic stats on the extracted features and label distribution."""
-    total   = len(rows)
-    pos     = sum(r["unrolled_faster"] for r in rows)
-    neg     = total - pos
+    """Print label distribution and feature ranges."""
+    total  = len(rows)
+    counts = {i: 0 for i in range(4)}
+    for r in rows:
+        counts[r["best_transformation"]] += 1
 
-    print(f"\nLabel distribution:")
-    print(f"  Unrolled faster (1): {pos} ({100*pos//total}%)")
-    print(f"  Not faster      (0): {neg} ({100*neg//total}%)")
+    print(f"\nLabel distribution (best transformation):")
+    for label_int, name in LABEL_NAMES.items():
+        n = counts[label_int]
+        print(f"  {label_int} {name:<20} {n:>5} ({100*n//total}%)")
 
     print(f"\nFeature ranges:")
     for col in FEATURE_COLUMNS:

@@ -1,15 +1,20 @@
 # model/train_rf_xgb.py
-# Trains and evaluates Random Forest and XGBoost models to predict whether
-# unrolling a loop will improve runtime performance.
+# Trains and evaluates Random Forest and XGBoost models to predict which
+# compiler transformation produces the fastest runtime for a given C function.
+#
+# Multi-class problem (4 classes):
+#   0 = original is fastest
+#   1 = unrolled is fastest
+#   2 = inlined is fastest
+#   3 = unrolled_inlined is fastest
 #
 # Validation strategy:
-#   - Stratified 80/20 train/test split (preserves 83/17 class ratio)
+#   - Stratified 80/20 train/test split (preserves class distribution)
 #   - Stratified 5-fold cross-validation on training set
 #   - Training F1 vs CV F1 gap to detect overfitting
 #   - Majority-class baseline to detect if model is just predicting majority
-#   - ROC-AUC score (better than accuracy for imbalanced data)
-#   - Threshold tuning to improve minority class (label=0) predictions
-#   - Learning curves to detect underfitting vs overfitting vs dataset size needs
+#   - Macro F1 and per-class F1 to check all classes are learned
+#   - Learning curves to detect underfitting vs overfitting
 #
 # GPU note (AMD RX 9060 XT):
 #   CPU is faster at this dataset size due to transfer overhead.
@@ -29,7 +34,7 @@ import math
 import pickle
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")   # non-interactive backend — saves to file instead of displaying
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from sklearn.ensemble        import RandomForestClassifier
@@ -37,8 +42,7 @@ from sklearn.model_selection import (
     train_test_split, StratifiedKFold, cross_val_score, learning_curve,
 )
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, confusion_matrix,
+    accuracy_score, f1_score, confusion_matrix, classification_report,
 )
 from sklearn.dummy   import DummyClassifier
 import xgboost as xgb
@@ -52,11 +56,11 @@ RANDOM_STATE = 42
 TEST_SIZE    = 0.2
 CV_FOLDS     = 5
 
-# Default classification threshold. 0.5 is standard but may not be optimal
-# for imbalanced data — we tune this below.
-DEFAULT_THRESHOLD = 0.5
+GPU_DEVICE   = "cpu"   # set to "cuda" for AMD GPU with ROCm
 
-GPU_DEVICE = "cpu"  # set to "cuda" for AMD GPU with ROCm
+# Class labels for display.
+LABEL_NAMES = {0: "original", 1: "unrolled", 2: "inlined", 3: "unrolled_inlined"}
+N_CLASSES   = 4
 
 FEATURE_COLUMNS = [
     # Phase 1 — loop structure
@@ -72,8 +76,13 @@ FEATURE_COLUMNS = [
     "array_writes_per_iter",
     "has_multiply",
     "total_body_stmts",
+    # Phase 2 — inlining
+    "has_function_call",
+    "num_helpers",
+    "helper_body_ops",
+    "call_count",
 ]
-LABEL_COLUMN = "unrolled_faster"
+LABEL_COLUMN = "best_transformation"
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
@@ -103,49 +112,28 @@ def load_dataset(path: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
 def build_random_forest() -> RandomForestClassifier:
     return RandomForestClassifier(
         n_estimators     = 200,
-        max_depth        = 10,   # was None — unlimited depth memorises training data
-        min_samples_leaf = 5,    # don't split a node if it has fewer than 5 samples
-        class_weight     = "balanced",
+        max_depth        = 10,   # limited to prevent memorisation
+        min_samples_leaf = 5,
+        class_weight     = "balanced",   # compensates for class imbalance
         random_state     = RANDOM_STATE,
         n_jobs           = -1,
     )
 
 
-def build_xgboost(scale_pos_weight: float) -> xgb.XGBClassifier:
+def build_xgboost(n_classes: int) -> xgb.XGBClassifier:
     return xgb.XGBClassifier(
         n_estimators     = 200,
-        max_depth        = 4,    # was 6 — shallower trees generalise better with few features
-        learning_rate    = 0.05, # was 0.1 — slower learning reduces overfitting
-        subsample        = 0.8,  # train each tree on 80% of samples — reduces memorisation
-        colsample_bytree = 0.8,  # use 80% of features per tree — reduces memorisation
-        scale_pos_weight = scale_pos_weight,
-        eval_metric      = "logloss",
+        max_depth        = 4,
+        learning_rate    = 0.05,
+        subsample        = 0.8,
+        colsample_bytree = 0.8,
+        objective        = "multi:softmax",  # multi-class classification
+        num_class        = n_classes,
+        eval_metric      = "mlogloss",       # multi-class log loss
         random_state     = RANDOM_STATE,
         device           = GPU_DEVICE,
         verbosity        = 0,
     )
-
-
-# ── Threshold tuning ──────────────────────────────────────────────────────────
-
-def tune_threshold(model, X_val: np.ndarray, y_val: np.ndarray) -> float:
-    """Find the probability threshold that maximises F1 on the validation set.
-
-    The default 0.5 threshold is calibrated for balanced classes. With an
-    83/17 imbalance, a lower threshold forces the model to predict label=0
-    more often, improving minority class recall at the cost of some precision.
-    """
-    probs = model.predict_proba(X_val)[:, 1]
-    best_f1, best_thresh = 0.0, DEFAULT_THRESHOLD
-
-    for thresh in np.arange(0.2, 0.8, 0.01):
-        preds = (probs >= thresh).astype(int)
-        score = f1_score(y_val, preds, zero_division=0)
-        if score > best_f1:
-            best_f1     = score
-            best_thresh = thresh
-
-    return best_thresh
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
@@ -160,69 +148,58 @@ def evaluate(
     feature_names: list[str],
     cv:            StratifiedKFold,
 ) -> dict:
-    """Full evaluation report: overfitting check, threshold tuning, metrics."""
+    """Full multi-class evaluation: overfitting check, per-class F1, importances."""
 
-    # ── Overfitting check: training score vs CV score ────────────────────────
-    # A large gap (train >> CV) means the model memorised training data.
-    train_f1 = f1_score(y_train, model.predict(X_train))
-    cv_f1s   = cross_val_score(model, X_train, y_train, cv=cv, scoring="f1")
+    y_pred = model.predict(X_test)
 
-    # ── Threshold tuning on test set ─────────────────────────────────────────
-    tuned_thresh = tune_threshold(model, X_test, y_test)
-    probs        = model.predict_proba(X_test)[:, 1]
-    y_pred_def   = (probs >= DEFAULT_THRESHOLD).astype(int)
-    y_pred_tuned = (probs >= tuned_thresh).astype(int)
+    # ── Overfitting check ─────────────────────────────────────────────────────
+    train_f1 = f1_score(y_train, model.predict(X_train), average="macro")
+    cv_f1s   = cross_val_score(
+        model, X_train, y_train, cv=cv, scoring="f1_macro"
+    )
 
     # ── Metrics ──────────────────────────────────────────────────────────────
-    def metrics(y_true, y_pred):
-        return dict(
-            acc  = accuracy_score(y_true, y_pred),
-            prec = precision_score(y_true, y_pred, zero_division=0),
-            rec  = recall_score(y_true, y_pred, zero_division=0),
-            f1   = f1_score(y_true, y_pred, zero_division=0),
-            auc  = roc_auc_score(y_true, probs),
-        )
-
-    m_def   = metrics(y_test, y_pred_def)
-    m_tuned = metrics(y_test, y_pred_tuned)
-    cm      = confusion_matrix(y_test, y_pred_tuned)
+    test_acc    = accuracy_score(y_test, y_pred)
+    test_f1_mac = f1_score(y_test, y_pred, average="macro",    zero_division=0)
+    test_f1_wt  = f1_score(y_test, y_pred, average="weighted", zero_division=0)
 
     # ── Print report ─────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"  {name}")
     print(f"{'='*60}")
 
-    # Overfitting check
     gap     = train_f1 - cv_f1s.mean()
     verdict = "OK" if gap < 0.05 else "POSSIBLE OVERFIT"
-    print(f"\n  Bias-Variance check:")
+    print(f"\n  Bias-Variance check (macro F1):")
     print(f"    Training F1:         {train_f1:.3f}")
     print(f"    CV F1 ({CV_FOLDS}-fold):      {cv_f1s.mean():.3f} ± {cv_f1s.std():.3f}")
     print(f"    Gap (train - CV):    {gap:.3f}  [{verdict}]")
 
-    # Default threshold metrics
-    print(f"\n  Default threshold ({DEFAULT_THRESHOLD:.2f}):")
-    print(f"    Accuracy:  {m_def['acc']:.3f}   Precision: {m_def['prec']:.3f}")
-    print(f"    Recall:    {m_def['rec']:.3f}   F1:        {m_def['f1']:.3f}")
-    print(f"    ROC-AUC:   {m_def['auc']:.3f}")
+    print(f"\n  Test metrics:")
+    print(f"    Accuracy:            {test_acc:.3f}")
+    print(f"    Macro F1:            {test_f1_mac:.3f}  (each class weighted equally)")
+    print(f"    Weighted F1:         {test_f1_wt:.3f}  (weighted by class frequency)")
 
-    # Tuned threshold metrics
-    print(f"\n  Tuned threshold ({tuned_thresh:.2f}):")
-    print(f"    Accuracy:  {m_tuned['acc']:.3f}   Precision: {m_tuned['prec']:.3f}")
-    print(f"    Recall:    {m_tuned['rec']:.3f}   F1:        {m_tuned['f1']:.3f}")
-    print(f"    ROC-AUC:   {m_tuned['auc']:.3f}  (same — threshold does not affect AUC)")
+    # Per-class F1 — shows which transformation classes the model struggles with.
+    print(f"\n  Per-class F1:")
+    per_class = f1_score(y_test, y_pred, average=None, zero_division=0)
+    for i, score in enumerate(per_class):
+        label_name = LABEL_NAMES.get(i, str(i))
+        bar        = "█" * int(score * 30)
+        count      = int((y_test == i).sum())
+        print(f"    {i} {label_name:<20} F1={score:.3f}  n={count:<5} {bar}")
 
-    # Confusion matrix
-    print(f"\n  Confusion matrix at tuned threshold (rows=actual, cols=predicted):")
-    print(f"    TN={cm[0,0]}  FP={cm[0,1]}   <- actual negatives (don't unroll)")
-    print(f"    FN={cm[1,0]}  TP={cm[1,1]}   <- actual positives (do unroll)")
+    # Confusion matrix.
+    print(f"\n  Confusion matrix (rows=actual, cols=predicted):")
+    cm     = confusion_matrix(y_test, y_pred)
+    header = "         " + "  ".join(f"{LABEL_NAMES[i][:6]:>6}" for i in range(N_CLASSES))
+    print(f"    {header}")
+    for i in range(N_CLASSES):
+        row_label = f"{LABEL_NAMES[i][:6]:>6}"
+        row_vals  = "  ".join(f"{cm[i,j]:>6}" for j in range(N_CLASSES))
+        print(f"    {row_label}  {row_vals}")
 
-    # Minority class catch rate — the key metric given the imbalance
-    neg_total = cm[0,0] + cm[0,1]
-    tn_rate   = cm[0,0] / neg_total if neg_total > 0 else 0
-    print(f"\n  Minority class (label=0) catch rate: {tn_rate:.1%} ({cm[0,0]}/{neg_total})")
-
-    # Feature importances
+    # Feature importances.
     print(f"\n  Feature importances (descending):")
     ranked = sorted(
         zip(feature_names, model.feature_importances_),
@@ -232,7 +209,13 @@ def evaluate(
         bar = "█" * int(imp * 40)
         print(f"    {feat:<32} {imp:.3f}  {bar}")
 
-    return {"name": name, "model": model, "cv_f1": cv_f1s.mean(), "auc": m_def["auc"]}
+    return {
+        "name":    name,
+        "model":   model,
+        "cv_f1":   cv_f1s.mean(),
+        "test_f1": test_f1_mac,
+        "acc":     test_acc,
+    }
 
 
 # ── Learning curves ───────────────────────────────────────────────────────────
@@ -244,13 +227,7 @@ def plot_learning_curves(
     cv:          StratifiedKFold,
     output_path: str,
 ) -> None:
-    """Plot training vs CV F1 as training set size increases.
-
-    How to read the curves:
-      Both converge LOW  → underfitting (model too simple, add features)
-      Train HIGH, CV LOW → overfitting (model memorising, reduce complexity)
-      Both converge HIGH → good fit (more data may still help if gap remains)
-    """
+    """Plot training vs CV macro-F1 as training set size increases."""
     fig, axes = plt.subplots(1, len(models), figsize=(6 * len(models), 5))
     if len(models) == 1:
         axes = [axes]
@@ -262,31 +239,27 @@ def plot_learning_curves(
             model, X_train, y_train,
             train_sizes = train_sizes,
             cv          = cv,
-            scoring     = "f1",
+            scoring     = "f1_macro",
             n_jobs      = -1,
         )
-        ax.plot(sizes, train_scores.mean(axis=1), label="Training F1",  color="steelblue")
-        ax.fill_between(
-            sizes,
+        ax.plot(sizes, train_scores.mean(axis=1), label="Training macro-F1", color="steelblue")
+        ax.fill_between(sizes,
             train_scores.mean(axis=1) - train_scores.std(axis=1),
             train_scores.mean(axis=1) + train_scores.std(axis=1),
-            alpha=0.1, color="steelblue",
-        )
-        ax.plot(sizes, cv_scores.mean(axis=1), label="CV F1", color="darkorange")
-        ax.fill_between(
-            sizes,
+            alpha=0.1, color="steelblue")
+        ax.plot(sizes, cv_scores.mean(axis=1), label="CV macro-F1", color="darkorange")
+        ax.fill_between(sizes,
             cv_scores.mean(axis=1) - cv_scores.std(axis=1),
             cv_scores.mean(axis=1) + cv_scores.std(axis=1),
-            alpha=0.1, color="darkorange",
-        )
+            alpha=0.1, color="darkorange")
         ax.set_title(name)
         ax.set_xlabel("Training set size")
-        ax.set_ylabel("F1 score")
-        ax.set_ylim(0.5, 1.05)
+        ax.set_ylabel("Macro F1")
+        ax.set_ylim(0.0, 1.05)
         ax.legend()
         ax.grid(alpha=0.3)
 
-    plt.suptitle("Learning Curves — compiler-opt", fontsize=13)
+    plt.suptitle("Learning Curves — compiler-opt (multi-class)", fontsize=13)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     print(f"\nLearning curves saved to {output_path}")
@@ -299,40 +272,35 @@ def main() -> None:
     X, y, feature_names = load_dataset(DATASET_PATH)
     print(f"  {len(X)} samples, {X.shape[1]} features")
 
-    pos = int(y.sum())
-    neg = int((y == 0).sum())
-    print(f"  Labels: {pos} positive ({100*pos/len(y):.1f}%)  "
-          f"{neg} negative ({100*neg/len(y):.1f}%)")
+    # Print class distribution.
+    print(f"  Class distribution:")
+    for i in range(N_CLASSES):
+        n = int((y == i).sum())
+        print(f"    {i} {LABEL_NAMES[i]:<20} {n:>5} ({100*n/len(y):.1f}%)")
 
-    # Stratified split preserves the 83/17 class ratio in both train and test.
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y,
     )
     print(f"  Train: {len(X_train)}  Test: {len(X_test)}")
 
-    # Stratified K-fold ensures every fold has the same class ratio as the full set.
     cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
     # ── Majority-class baseline ───────────────────────────────────────────────
-    # A model that always predicts label=1 gives us the floor to beat.
-    # If our model can't beat this, it's learned nothing useful.
     dummy = DummyClassifier(strategy="most_frequent")
     dummy.fit(X_train, y_train)
     baseline_acc = accuracy_score(y_test, dummy.predict(X_test))
-    baseline_f1  = f1_score(y_test, dummy.predict(X_test), zero_division=0)
-    print(f"\nMajority-class baseline (always predict 'unroll'):")
-    print(f"  Accuracy: {baseline_acc:.3f}   F1: {baseline_f1:.3f}")
-    print(f"  Our models must beat these numbers to be doing anything useful.")
+    baseline_f1  = f1_score(y_test, dummy.predict(X_test), average="macro", zero_division=0)
+    print(f"\nMajority-class baseline (always predict most frequent class):")
+    print(f"  Accuracy: {baseline_acc:.3f}   Macro F1: {baseline_f1:.3f}")
+    print(f"  Our models must beat these to be doing anything useful.")
 
     # ── Train ─────────────────────────────────────────────────────────────────
-    scale_pos = neg / pos if pos > 0 else 1.0
-
     print("\nTraining Random Forest...")
     rf = build_random_forest()
     rf.fit(X_train, y_train)
 
     print("Training XGBoost...")
-    xgb_model = build_xgboost(scale_pos)
+    xgb_model = build_xgboost(N_CLASSES)
     xgb_model.fit(X_train, y_train)
 
     # ── Evaluate ──────────────────────────────────────────────────────────────
@@ -343,11 +311,11 @@ def main() -> None:
     print(f"\n{'='*60}")
     print(f"  Summary")
     print(f"{'='*60}")
-    print(f"  {'Model':<25} {'CV F1':>8} {'ROC-AUC':>9}")
-    print(f"  {'-'*44}")
-    print(f"  {'Baseline (majority)':<25} {'N/A':>8} {'N/A':>9}")
+    print(f"  {'Model':<25} {'CV Macro F1':>12} {'Test Macro F1':>14} {'Accuracy':>9}")
+    print(f"  {'-'*62}")
+    print(f"  {'Baseline':<25} {'N/A':>12} {baseline_f1:>14.3f} {baseline_acc:>9.3f}")
     for r in [rf_results, xgb_results]:
-        print(f"  {r['name']:<25} {r['cv_f1']:>8.3f} {r['auc']:>9.3f}")
+        print(f"  {r['name']:<25} {r['cv_f1']:>12.3f} {r['test_f1']:>14.3f} {r['acc']:>9.3f}")
 
     # ── Learning curves ───────────────────────────────────────────────────────
     curves_path = os.path.join(MODEL_DIR, "learning_curves.png")
